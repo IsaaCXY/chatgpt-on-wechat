@@ -1,6 +1,7 @@
 """
 channel factory
 """
+from common.log import logger
 
 def create_channel(channel_type):
     """
@@ -8,6 +9,7 @@ def create_channel(channel_type):
     :param channel_type: channel type code
     :return: channel instance
     """
+    logger.info(channel_type)
     if channel_type == 'wx':
         from channel.wechat.wechat_channel import WechatChannel
         return WechatChannel()
