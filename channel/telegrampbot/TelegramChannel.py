@@ -9,8 +9,6 @@ from telegram import Chat, ChatMember, ChatMemberUpdated, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    ChatMemberHandler,
-    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -22,10 +20,11 @@ class TelegramChannel(Channel):
         pass
 
     def startup(self):
+        logger.info("创建telegram")
         application = Application.builder().token(conf().get("telegramToken")).build()
-        application.add_handler(MessageHandler(filters.ALL, self._echo()))
+        application.add_handler(MessageHandler(filters.ALL, self._echo))
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    def _echo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _echo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(update.message.text)
 
