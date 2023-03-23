@@ -28,3 +28,11 @@ class TelegramChannel(Channel):
     async def _echo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(update.message.text)
 
+    async def reply_info(self, update: Update, context):
+        input_message_text = update.message.text
+
+        if input_message_text.startswith("bot "):
+            bot_reply = super(TelegramChannel, self).build_reply_content(input_message_text)
+            await update.message.reply_text(bot_reply)
+        else:
+            await update.message.reply_text(input_message_text)
