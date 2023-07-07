@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# move chatgpt-on-wechat
-tar -zcf chatgpt-on-wechat.tar.gz --exclude=../../chatgpt-on-wechat/docker  ../../chatgpt-on-wechat
+unset KUBECONFIG
 
-# build image
-docker build -f Dockerfile.alpine \
+cd .. && docker build -f docker/Dockerfile.latest \
              -t zhayujie/chatgpt-on-wechat .
+
+docker tag zhayujie/chatgpt-on-wechat zhayujie/chatgpt-on-wechat:$(date +%y%m%d)

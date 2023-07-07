@@ -3,22 +3,37 @@ import sys
 import os
 
 
-def _get_logger():
-    log = logging.getLogger('log')
-    log.setLevel(logging.INFO)
+def _reset_logger(log):
+    for handler in log.handlers:
+        handler.close()
+        log.removeHandler(handler)
+        del handler
+    log.handlers.clear()
+    log.propagate = False
     console_handle = logging.StreamHandler(sys.stdout)
-    log_formatter = logging.Formatter('[%(levelname)s][%(asctime)s][%(filename)s:%(lineno)d] - %(message)s',
-                                                  datefmt='%Y-%m-%d %H:%M:%S')
-    console_handle.setFormatter(log_formatter)
+    console_handle.setFormatter(
+        logging.Formatter(
+            "[%(levelname)s][%(asctime)s][%(filename)s:%(lineno)d] - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
 
     if not os.path.exists(".log"):
         os.makedirs(".log")
     file_handle = logging.FileHandler(".log/robot.log",mode="a", encoding="utf_8")
     file_handle.setLevel(logging.DEBUG)
-    file_handle.setFormatter(log_formatter)
+    file_handle.setFormatter(logging.Formatter(
+            "[%(levelname)s][%(asctime)s][%(filename)s:%(lineno)d] - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
 
     log.addHandler(console_handle)
     log.addHandler(file_handle)
+
+def _get_logger():
+    log = logging.getLogger("log")
+    _reset_logger(log)
+    log.setLevel(logging.INFO)
     return log
 
 

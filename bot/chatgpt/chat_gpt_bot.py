@@ -1,67 +1,97 @@
 # encoding:utf-8
 
+import time
+
+import openai
+import openai.error
+import requests
+
 from bot.bot import Bot
+from bot.chatgpt.chat_gpt_session import ChatGPTSession
+from bot.openai.open_ai_image import OpenAIImage
+from bot.session_manager import SessionManager
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
-from config import conf, load_config
 from common.log import logger
 from common.token_bucket import TokenBucket
-from common.expired_dict import ExpiredDict
-import openai
-import time
+from config import conf, load_config
 
 
 # OpenAI对话模型API (可用)
-class ChatGPTBot(Bot):
+class ChatGPTBot(Bot, OpenAIImage):
     def __init__(self):
-        openai.api_key = conf().get('open_ai_api_key')
-        if conf().get('open_ai_api_base'):
-            openai.api_base = conf().get('open_ai_api_base')
-        proxy = conf().get('proxy')
-        self.sessions = SessionManager()
+        super().__init__()
+        # set the default api_key
+        openai.api_key = conf().get("open_ai_api_key")
+        if conf().get("open_ai_api_base"):
+            openai.api_base = conf().get("open_ai_api_base")
+        proxy = conf().get("proxy")
         if proxy:
             openai.proxy = proxy
-        if conf().get('rate_limit_chatgpt'):
-            self.tb4chatgpt = TokenBucket(conf().get('rate_limit_chatgpt', 20))
-        if conf().get('rate_limit_dalle'):
-            self.tb4dalle = TokenBucket(conf().get('rate_limit_dalle', 50))
+        if conf().get("rate_limit_chatgpt"):
+            self.tb4chatgpt = TokenBucket(conf().get("rate_limit_chatgpt", 20))
+
+        self.sessions = SessionManager(ChatGPTSession, model=conf().get("model") or "gpt-3.5-turbo")
+        self.args = {
+            "model": conf().get("model") or "gpt-3.5-turbo",  # 对话模型的名称
+            "temperature": conf().get("temperature", 0.9),  # 值在[0,1]之间，越大表示回复越具有不确定性
+            # "max_tokens":4096,  # 回复最大的字符数
+            "top_p": conf().get("top_p", 1),
+            "frequency_penalty": conf().get("frequency_penalty", 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
+            "presence_penalty": conf().get("presence_penalty", 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
+            "request_timeout": conf().get("request_timeout", None),  # 请求超时时间，openai接口默认设置为600，对于难问题一般需要较长时间
+            "timeout": conf().get("request_timeout", None),  # 重试超时时间，在这个时间内，将会自动重试
+        }
 
     def reply(self, query, context=None):
         # acquire reply content
         if context.type == ContextType.TEXT:
-            logger.info("[OPEN_AI] query={}".format(query))
+            logger.info("[CHATGPT] query={}".format(query))
 
-            session_id = context['session_id']
+            session_id = context["session_id"]
             reply = None
-            clear_memory_commands = conf().get('clear_memory_commands', ['#清除记忆'])
+            clear_memory_commands = conf().get("clear_memory_commands", ["#清除记忆"])
             if query in clear_memory_commands:
                 self.sessions.clear_session(session_id)
-                reply = Reply(ReplyType.INFO, '记忆已清除')
-            elif query == '#清除所有':
+                reply = Reply(ReplyType.INFO, "记忆已清除")
+            elif query == "#清除所有":
                 self.sessions.clear_all_session()
-                reply = Reply(ReplyType.INFO, '所有人记忆已清除')
-            elif query == '#更新配置':
+                reply = Reply(ReplyType.INFO, "所有人记忆已清除")
+            elif query == "#更新配置":
                 load_config()
-                reply = Reply(ReplyType.INFO, '配置已更新')
+                reply = Reply(ReplyType.INFO, "配置已更新")
             if reply:
                 return reply
-            session = self.sessions.build_session_query(query, session_id)
-            logger.debug("[OPEN_AI] session query={}".format(session))
+            session = self.sessions.session_query(query, session_id)
+            logger.debug("[CHATGPT] session query={}".format(session.messages))
 
+            api_key = context.get("openai_api_key")
+            model = context.get("gpt_model")
+            new_args = None
+            if model:
+                new_args = self.args.copy()
+                new_args["model"] = model
             # if context.get('stream'):
             #     # reply in stream
             #     return self.reply_text_stream(query, new_query, session_id)
 
-            reply_content = self.reply_text(session, session_id, 0)
-            logger.debug("[OPEN_AI] new_query={}, session_id={}, reply_cont={}".format(session, session_id, reply_content["content"]))
-            if reply_content['completion_tokens'] == 0 and len(reply_content['content']) > 0:
-                reply = Reply(ReplyType.ERROR, reply_content['content'])
+            reply_content = self.reply_text(session, api_key, args=new_args)
+            logger.debug(
+                "[CHATGPT] new_query={}, session_id={}, reply_cont={}, completion_tokens={}".format(
+                    session.messages,
+                    session_id,
+                    reply_content["content"],
+                    reply_content["completion_tokens"],
+                )
+            )
+            if reply_content["completion_tokens"] == 0 and len(reply_content["content"]) > 0:
+                reply = Reply(ReplyType.ERROR, reply_content["content"])
             elif reply_content["completion_tokens"] > 0:
-                self.sessions.save_session(reply_content["content"], session_id, reply_content["total_tokens"])
+                self.sessions.session_reply(reply_content["content"], session_id, reply_content["total_tokens"])
                 reply = Reply(ReplyType.TEXT, reply_content["content"])
             else:
-                reply = Reply(ReplyType.ERROR, reply_content['content'])
-                logger.debug("[OPEN_AI] reply {} used 0 tokens.".format(reply_content))
+                reply = Reply(ReplyType.ERROR, reply_content["content"])
+                logger.debug("[CHATGPT] reply {} used 0 tokens.".format(reply_content))
             return reply
 
         elif context.type == ContextType.IMAGE_CREATE:
@@ -73,149 +103,91 @@ class ChatGPTBot(Bot):
                 reply = Reply(ReplyType.ERROR, retstring)
             return reply
         else:
-            reply = Reply(ReplyType.ERROR, 'Bot不支持处理{}类型的消息'.format(context.type))
+            reply = Reply(ReplyType.ERROR, "Bot不支持处理{}类型的消息".format(context.type))
             return reply
 
-    def reply_text(self, session, session_id, retry_count=0) -> dict:
-        '''
+    def reply_text(self, session: ChatGPTSession, api_key=None, args=None, retry_count=0) -> dict:
+        """
         call openai's ChatCompletion to get the answer
         :param session: a conversation session
         :param session_id: session id
         :param retry_count: retry count
         :return: {}
-        '''
+        """
         try:
-            if conf().get('rate_limit_chatgpt') and not self.tb4chatgpt.get_token():
-                return {"completion_tokens": 0, "content": "提问太快啦，请休息一下再问我吧"}
-            response = openai.ChatCompletion.create(
-                model= conf().get("model") or "gpt-3.5-turbo",  # 对话模型的名称
-                messages=session,
-                temperature=conf().get('temperature', 0.9),  # 值在[0,1]之间，越大表示回复越具有不确定性
-                #max_tokens=4096,  # 回复最大的字符数
-                top_p=1,
-                frequency_penalty=conf().get('frequency_penalty', 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
-                presence_penalty=conf().get('presence_penalty', 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
-            )
+            if conf().get("rate_limit_chatgpt") and not self.tb4chatgpt.get_token():
+                raise openai.error.RateLimitError("RateLimitError: rate limit exceeded")
+            # if api_key == None, the default openai.api_key will be used
+            if args is None:
+                args = self.args
+            response = openai.ChatCompletion.create(api_key=api_key, messages=session.messages, **args)
+            # logger.debug("[CHATGPT] response={}".format(response))
             # logger.info("[ChatGPT] reply={}, total_tokens={}".format(response.choices[0]['message']['content'], response["usage"]["total_tokens"]))
-            return {"total_tokens": response["usage"]["total_tokens"],
-                    "completion_tokens": response["usage"]["completion_tokens"],
-                    "content": response.choices[0]['message']['content']}
-        except openai.error.RateLimitError as e:
-            # rate limit exception
-            logger.warn(e)
-            if retry_count < 1:
-                time.sleep(5)
-                logger.warn("[OPEN_AI] RateLimit exceed, 第{}次重试".format(retry_count+1))
-                return self.reply_text(session, session_id, retry_count+1)
-            else:
-                return {"completion_tokens": 0, "content": "提问太快啦，请休息一下再问我吧"}
-        except openai.error.APIConnectionError as e:
-            # api connection exception
-            logger.warn(e)
-            logger.warn("[OPEN_AI] APIConnection failed")
-            return {"completion_tokens": 0, "content": "我连接不到你的网络"}
-        except openai.error.Timeout as e:
-            logger.warn(e)
-            logger.warn("[OPEN_AI] Timeout")
-            return {"completion_tokens": 0, "content": "我没有收到你的消息"}
+            return {
+                "total_tokens": response["usage"]["total_tokens"],
+                "completion_tokens": response["usage"]["completion_tokens"],
+                "content": response.choices[0]["message"]["content"],
+            }
         except Exception as e:
-            # unknown exception
-            logger.exception(e)
-            self.sessions.clear_session(session_id)
-            return {"completion_tokens": 0, "content": "请再问我一次吧"}
-
-    def create_img(self, query, retry_count=0):
-        try:
-            if conf().get('rate_limit_dalle') and not self.tb4dalle.get_token():
-                return False, "请求太快了，请休息一下再问我吧"
-            logger.info("[OPEN_AI] image_query={}".format(query))
-            response = openai.Image.create(
-                prompt=query,    #图片描述
-                n=1,             #每次生成图片的数量
-                size="256x256"   #图片大小,可选有 256x256, 512x512, 1024x1024
-            )
-            image_url = response['data'][0]['url']
-            logger.info("[OPEN_AI] image_url={}".format(image_url))
-            return True, image_url
-        except openai.error.RateLimitError as e:
-            logger.warn(e)
-            if retry_count < 1:
-                time.sleep(5)
-                logger.warn("[OPEN_AI] ImgCreate RateLimit exceed, 第{}次重试".format(retry_count+1))
-                return self.create_img(query, retry_count+1)
+            need_retry = retry_count < 2
+            result = {"completion_tokens": 0, "content": "我现在有点累了，等会再来吧"}
+            if isinstance(e, openai.error.RateLimitError):
+                logger.warn("[CHATGPT] RateLimitError: {}".format(e))
+                result["content"] = "提问太快啦，请休息一下再问我吧"
+                if need_retry:
+                    time.sleep(20)
+            elif isinstance(e, openai.error.Timeout):
+                logger.warn("[CHATGPT] Timeout: {}".format(e))
+                result["content"] = "我没有收到你的消息"
+                if need_retry:
+                    time.sleep(5)
+            elif isinstance(e, openai.error.APIError):
+                logger.warn("[CHATGPT] Bad Gateway: {}".format(e))
+                result["content"] = "请再问我一次"
+                if need_retry:
+                    time.sleep(10)
+            elif isinstance(e, openai.error.APIConnectionError):
+                logger.warn("[CHATGPT] APIConnectionError: {}".format(e))
+                need_retry = False
+                result["content"] = "我连接不到你的网络"
             else:
-                return False, "提问太快啦，请休息一下再问我吧"
-        except Exception as e:
-            logger.exception(e)
-            return False, str(e)
+                logger.exception("[CHATGPT] Exception: {}".format(e))
+                need_retry = False
+                self.sessions.clear_session(session.session_id)
+
+            if need_retry:
+                logger.warn("[CHATGPT] 第{}次重试".format(retry_count + 1))
+                return self.reply_text(session, api_key, args, retry_count + 1)
+            else:
+                return result
 
 
-class SessionManager(object):
+class AzureChatGPTBot(ChatGPTBot):
     def __init__(self):
-        if conf().get('expires_in_seconds'):
-            sessions = ExpiredDict(conf().get('expires_in_seconds'))
-        else:
-            sessions = dict()
-        self.sessions = sessions
+        super().__init__()
+        openai.api_type = "azure"
+        openai.api_version = "2023-03-15-preview"
+        self.args["deployment_id"] = conf().get("azure_deployment_id")
 
-    def build_session(self, session_id, system_prompt=None):
-        session = self.sessions.get(session_id, [])
-        if len(session) == 0:
-            if system_prompt is None:
-                system_prompt = conf().get("character_desc", "")
-            system_item = {'role': 'system', 'content': system_prompt}
-            session.append(system_item)
-            self.sessions[session_id] = session
-        return session
-
-    def build_session_query(self, query, session_id):
-        '''
-        build query with conversation history
-        e.g.  [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Who won the world series in 2020?"},
-            {"role": "assistant", "content": "The Los Angeles Dodgers won the World Series in 2020."},
-            {"role": "user", "content": "Where was it played?"}
-        ]
-        :param query: query content
-        :param session_id: session id
-        :return: query content with conversaction
-        '''
-        session = self.build_session(session_id)
-        user_item = {'role': 'user', 'content': query}
-        session.append(user_item)
-        return session
-
-    def save_session(self, answer, session_id, total_tokens):
-        max_tokens = conf().get("conversation_max_tokens")
-        if not max_tokens:
-            # default 3000
-            max_tokens = 1000
-        max_tokens = int(max_tokens)
-
-        session = self.sessions.get(session_id)
-        if session:
-            # append conversation
-            gpt_item = {'role': 'assistant', 'content': answer}
-            session.append(gpt_item)
-
-        # discard exceed limit conversation
-        self.discard_exceed_conversation(session, max_tokens, total_tokens)
-
-    def discard_exceed_conversation(self, session, max_tokens, total_tokens):
-        dec_tokens = int(total_tokens)
-        # logger.info("prompt tokens used={},max_tokens={}".format(used_tokens,max_tokens))
-        while dec_tokens > max_tokens:
-            # pop first conversation
-            if len(session) > 3:
-                session.pop(1)
-                session.pop(1)
-            else:
-                break
-            dec_tokens = dec_tokens - max_tokens
-
-    def clear_session(self, session_id):
-        self.sessions[session_id] = []
-
-    def clear_all_session(self):
-        self.sessions.clear()
+    def create_img(self, query, retry_count=0, api_key=None):
+        api_version = "2022-08-03-preview"
+        url = "{}dalle/text-to-image?api-version={}".format(openai.api_base, api_version)
+        api_key = api_key or openai.api_key
+        headers = {"api-key": api_key, "Content-Type": "application/json"}
+        try:
+            body = {"caption": query, "resolution": conf().get("image_create_size", "256x256")}
+            submission = requests.post(url, headers=headers, json=body)
+            operation_location = submission.headers["Operation-Location"]
+            retry_after = submission.headers["Retry-after"]
+            status = ""
+            image_url = ""
+            while status != "Succeeded":
+                logger.info("waiting for image create..., " + status + ",retry after " + retry_after + " seconds")
+                time.sleep(int(retry_after))
+                response = requests.get(operation_location, headers=headers)
+                status = response.json()["status"]
+            image_url = response.json()["result"]["contentUrl"]
+            return True, image_url
+        except Exception as e:
+            logger.error("create image error: {}".format(e))
+            return False, "图片生成失败"
